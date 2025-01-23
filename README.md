@@ -134,4 +134,3 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Acknowledgments
 
 - This project was inspired by the need for unified network management.
-- Built with ❤️ using Python, NetBox, and UniFi APIs.
