@@ -34,7 +34,7 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    pip install -r requirements.txt
    ```
 
-3Create a `.env` file at the root of the project to store sensitive information such as usernames, passwords, and tokens. The `.env` file should look like this:
+3. Create a `.env` file at the root of the project to store sensitive information such as usernames, passwords, and tokens. The `.env` file should look like this:
    ```plaintext
    UNIFI_USERNAME=your-unifi-username
    UNIFI_PASSWORD=your-unifi-password
@@ -42,7 +42,7 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    NETBOX_TOKEN=your-netbox-api-token
    ```
 
-4Copy the sample configuration file to `config/config.yaml`:
+4. Copy the sample configuration file to `config/config.yaml`:
    ```bash
    cp config/config.yaml.SAMPLE config/config.yaml
    ```
