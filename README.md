@@ -26,7 +26,7 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
 1. Clone the repository:
    ```bash
    git clone https://github.com/mrzepa/unifi2netbox.git
-   cd netbox-unifi-integration
+   cd unifi2netbox
    ```
 
 2. Install dependencies:
