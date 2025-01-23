@@ -1,0 +1,9 @@
+UNIFI:
+  URLS: # create a list of unifi controllers
+  - https://<ip address>:8443
+NETBOX:
+  URL: http://localhost:8080
+  ROLES:
+    WIRELESS: <name of wireless device role>
+    LAN: <name of switch role>
+  TENANT: <name of tenant>

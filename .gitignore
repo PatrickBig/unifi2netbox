@@ -1,0 +1,5 @@
+.env
+.unifi_session.json
+!logs/.keep
+logs/*
+config/config.yaml
