@@ -1,9 +1,0 @@
-UNIFI:
-  URLS:
-  - https://10.140.10.22:8443
-NETBOX:
-  URL: http://localhost:8080
-  ROLES:
-    WIRELESS: Wireless
-    LAN: LAN
-  TENANT: Vet Strategy
