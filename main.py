@@ -4,7 +4,6 @@ from slugify import slugify
 import os
 import re
 import sys
-import pyotp
 import requests
 import warnings
 import logging
@@ -13,234 +12,141 @@ import ipaddress
 import yaml
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
+# Import the unifi module instead of defining the Unifi class
+from unifi.unifi import Unifi
 # Suppress only the InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
 # Define threads for each layer
 MAX_CONTROLLER_THREADS = 5  # Number of UniFi controllers to process concurrently
 MAX_SITE_THREADS = 8  # Number of sites to process concurrently per controller
 MAX_DEVICE_THREADS = 8  # Number of devices to process concurrently per site
 MAX_THREADS = 8 # Define threads based on available system cores or default
 
-class Unifi:
+def get_postable_fields(base_url, token, url_path):
     """
-    Handles interactions with UniFi API, including session management, authentication,
-    and making API requests.
-
-    This class is designed to manage authentication and handle sessions for interacting
-    with UniFi API endpoints. It supports saving and loading session details to and from
-    a file to minimize frequent reauthentication. It also includes methods for making
-    authenticated requests using various HTTP methods.
-
-    :ivar base_url: Base URL of the UniFi API, retrieved from environment variable
-    :ivar username: Username for authentication, retrieved from environment variable
-    :ivar password: Password for authentication, retrieved from environment variable
-    :ivar mfa_secret: Secret key for Multi-Factor Authentication, retrieved from environment variable
-    :ivar udm_pro: Specific path for UDM-Pro; initialized as an empty string
-    :ivar session_cookie: Cookie for managing UniFi sessions, initializes as None
-    :ivar csrf_token: CSRF token for API requests, initializes as None
-    :type base_url: str
-    :type username: str
-    :type password: str
-    :type mfa_secret: str
-    :type udm_pro: str
-    :type session_cookie: Optional[str]
-    :type csrf_token: Optional[str]
+    Retrieves the POST-able fields for NetBox path.
     """
-    SESSION_FILE = os.path.expanduser("~/.unifi_session.json")
+    url = f"{base_url}/api/{url_path}/"
+    logger.debug(f"Retrieving POST-able fields from NetBox API: {url}")
+    headers = {
+        "Authorization": f"Token {token}",
+        "Content-Type": "application/json",
+    }
+    response = requests.options(url, headers=headers, verify=False)
+    response.raise_for_status()  # Raise an error if the response is not successful
 
-    def __init__(self, base_url=None, username=None, password=None, mfa_secret=None):
-        self.base_url = base_url
-        self.username = username
-        self.password = password
-        self.mfa_secret = mfa_secret
-        self.udm_pro = ''
-        self.session_cookie = None
-        self.csrf_token = None
-        self.load_session_from_file()
+    # Extract the available POST fields from the API schema
+    fields = response.json().get("actions", {}).get("POST", {})
+    logger.debug(f"Retrieved {len(fields)} POST-able fields from NetBox API")
+    return fields
 
-        if not all([self.base_url, self.username, self.password, self.mfa_secret]):
-            raise ValueError("Missing required environment variables: BASE_URL, USERNAME, PASSWORD, or MFA_SECRET")
-
-    def save_session_to_file(self):
-        session_data = {
-            "session_cookie": self.session_cookie,
-            "csrf_token": self.csrf_token
-        }
-        with open(self.SESSION_FILE, "w") as f:
-            json.dump(session_data, f)
-        logger.info("Session data saved to file.")
-
-    def load_session_from_file(self):
-        if os.path.exists(self.SESSION_FILE):
-            with open(self.SESSION_FILE, "r") as f:
-                session_data = json.load(f)
-                self.session_cookie = session_data.get("session_cookie")
-                self.csrf_token = session_data.get("csrf_token")
-                logger.info("Loaded session data from file.")
-
-    def authenticate(self, retry_count=0, max_retries=3):
-        """Logs in and retrieves a session cookie and CSRF token."""
-        if retry_count >= max_retries:
-            logger.error("Max authentication retries reached. Aborting authentication.")
-            raise Exception("Authentication failed after maximum retries.")
-
-        login_endpoint = f"{self.base_url}/api/{self.udm_pro}login"
-        if not self.mfa_secret:
-            raise ValueError("MFA_SECRET is missing or invalid.")
-
-        otp = pyotp.TOTP(self.mfa_secret).now()
-        payload = {
-            "username": self.username,
-            "password": self.password,
-            "ubic_2fa_token": otp,
-        }
-
-        session = requests.Session()
-        session.timeout = 10
-
+def load_site_mapping(config=None):
+    """
+    Load site mapping from configuration or YAML file.
+    Returns a dictionary mapping UniFi site names to NetBox site names.
+    
+    :param config: Configuration dictionary loaded from config.yaml
+    :return: Dictionary mapping UniFi site names to NetBox site names
+    """
+    # Initialize with empty mapping
+    site_mapping = {}
+    
+    # First check if config has site mappings defined directly
+    if config and 'UNIFI' in config and 'SITE_MAPPINGS' in config['UNIFI']:
+        logger.debug("Loading site mappings from config.yaml")
+        config_mappings = config['UNIFI']['SITE_MAPPINGS']
+        if config_mappings:
+            site_mapping.update(config_mappings)
+            logger.debug(f"Loaded {len(config_mappings)} site mappings from config.yaml")
+    
+    # Check if we should use the external mapping file
+    use_file_mapping = False
+    if config and 'UNIFI' in config and 'USE_SITE_MAPPING' in config['UNIFI']:
+        use_file_mapping = config['UNIFI']['USE_SITE_MAPPING']
+        
+    if use_file_mapping:
+        site_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', 'site_mapping.yaml')
+        logger.debug(f"Loading site mapping from file: {site_mapping_path}")
+        
+        # Check if file exists, if not create a default one
+        if not os.path.exists(site_mapping_path):
+            logger.warning(f"Site mapping file not found at {site_mapping_path}. Creating a default one.")
+            os.makedirs(os.path.dirname(site_mapping_path), exist_ok=True)
+            with open(site_mapping_path, 'w') as f:
+                f.write("# Site mapping configuration\n")
+                f.write("# Format: unifi_site_name: netbox_site_name\n")
+                f.write("\"Default\": \"Default\"\n")
+            
         try:
-            response = session.post(login_endpoint, json=payload, verify=False)
-            response_data = response.json()
-            response.raise_for_status()
-            if response_data.get("meta", {}).get("rc") == "ok":
-                logger.info("Logged in successfully.")
-                self.session_cookie = session.cookies.get("unifises")
-                self.csrf_token = session.cookies.get("csrf_token")
-                self.save_session_to_file()
-                return
-            elif response_data.get("meta", {}).get("msg") == "api.err.Invalid2FAToken":
-                logger.warning("Invalid 2FA token detected. Waiting for the next token...")
-                # Wait for the current TOTP token to expire (~30 seconds for most TOTP systems)
-                # Adjust the timing based on your specific TOTP configuration.
-                import time
-                time.sleep(30)
-                # Retry authentication with the next token
-                return self.authenticate(retry_count=retry_count + 1, max_retries=max_retries)
-            else:
-                logger.error(f"Login failed: {response_data.get('meta', {}).get('msg')}")
-                raise Exception("Login failed.")
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP error occurred: {http_err}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Authentication error: {e}. Retrying ({retry_count + 1}/{max_retries})...")
-            self.authenticate(retry_count=retry_count + 1)
-        except json.JSONDecodeError as json_err:
-            logger.error(f"Failed to decode JSON response: {json_err}")
-            return None
+            with open(site_mapping_path, 'r') as f:
+                file_mapping = yaml.safe_load(f) or {}
+                logger.debug(f"Loaded {len(file_mapping)} mappings from site_mapping.yaml")
+                # Update the mapping with file values (config values take precedence)
+                for key, value in file_mapping.items():
+                    if key not in site_mapping:  # Don't overwrite config mappings
+                        site_mapping[key] = value
+        except Exception as e:
+            logger.error(f"Error loading site mapping file: {e}")
+    
+    logger.debug(f"Final site mapping has {len(site_mapping)} entries")
+    return site_mapping
 
-    def make_request(self, endpoint, method="GET", data=None, retry_count=0, max_retries=3):
-        """Makes an authenticated request to the UniFi API."""
-        if not self.session_cookie or not self.csrf_token:
-            print("No valid session. Authenticating...")
-            self.authenticate()
-
-        try:
-            if method.upper() not in ["GET", "POST", "PUT", "DELETE"]:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-        except ValueError as e:
-            logger.error(e)
-            return None
-
-        headers = {
-            "X-CSRF-Token": self.csrf_token,
-            "Content-Type": "application/json"
-        }
-        cookies = {
-            "unifises": self.session_cookie
-        }
-
-        url = f"{self.base_url}{endpoint}"
-
-        try:
-            if method.upper() == "GET":
-                response = requests.get(url, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "POST":
-                response = requests.post(url, json=data, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "PUT":
-                response = requests.put(url, json=data, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "DELETE":
-                response = requests.delete(url, headers=headers, cookies=cookies, verify=False)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-
-            # Handle session expiry
-            if response.status_code == 401:
-                logger.warning("Session expired. Re-authenticating...")
-                self.authenticate()
-                return self.make_request(endpoint, method, data, retry_count=0)
-            elif response.status_code == 400:
-                # Log API errors for debugging
-                logger.error(f"Request failed with 400: {response.text}")
-                return None  # Handle site context or other app-level issues.
-
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"An error occurred: {e}")
-            return None
-
-def normalize_site_name(name):
+def get_netbox_site_name(unifi_site_name, config=None):
     """
-    Normalize the Ubiquity site name by:
-    - Removing 2-character uppercase abbreviations (e.g., "AH").
-    - Removing anything in parentheses
-    - Replacing non-breaking spaces with regular spaces.
-     - Removing hyphens.
-    - Stripping leading/trailing whitespace.
+    Get NetBox site name from UniFi site name using the mapping table.
+    If no mapping exists, return the original name.
+    
+    :param unifi_site_name: The UniFi site name to look up
+    :param config: Configuration dictionary loaded from config.yaml
+    :return: The corresponding NetBox site name or the original name if no mapping exists
     """
+    site_mapping = load_site_mapping(config)
+    mapped_name = site_mapping.get(unifi_site_name, unifi_site_name)
+    if mapped_name != unifi_site_name:
+        logger.debug(f"Mapped UniFi site '{unifi_site_name}' to NetBox site '{mapped_name}'")
+    return mapped_name
 
-    # Replace non-breaking spaces with regular spaces
-    name = name.replace('\xa0', ' ')
-
-    # Remove anything in parentheses
-    name = re.sub(r'\([^)]*\)', '', name)
-
-    # Remove 2-character uppercase abbreviations
-    parts = name.split()
-    filtered_parts = [part for part in parts if not re.match(r'^[A-Z]{2}$', part)]
-
-    # Remove hyphens
-    name = name.replace('-', '')
-
-    # Join the result into a single string and strip spaces
-    normalized = ' '.join(filtered_parts).strip()
-    return normalized
 def prepare_netbox_sites(netbox_sites):
     """
-    Pre-process NetBox sites by normalizing their names.
+    Pre-process NetBox sites for lookup.
 
-    :param netbox_sites: List of NetBox site dictionaries (each containing 'name').
-    :return: A dictionary mapping normalized names to the original NetBox site objects.
+    :param netbox_sites: List of NetBox site objects.
+    :return: A dictionary mapping NetBox site names to the original NetBox site objects.
     """
-    normalized_netbox_sites = {}
+    netbox_sites_dict = {}
     for netbox_site in netbox_sites:
-        normalized_name = normalize_site_name(netbox_site.name)
-        normalized_netbox_sites[normalized_name] = netbox_site
-    return normalized_netbox_sites
+        netbox_sites_dict[netbox_site.name] = netbox_site
+    return netbox_sites_dict
 
-def match_sites_to_netbox(ubiquity_desc, normalized_netbox_sites):
+def match_sites_to_netbox(ubiquity_desc, netbox_sites_dict, config=None):
     """
-    Match Ubiquity site with normalized NetBox sites by comparing substrings.
+    Match Ubiquity site to NetBox site using the site mapping configuration.
 
     :param ubiquity_desc: The description of the Ubiquity site.
-    :param normalized_netbox_sites: A dictionary mapping normalized NetBox site names to site objects.
+    :param netbox_sites_dict: A dictionary mapping NetBox site names to site objects.
+    :param config: Configuration dictionary loaded from config.yaml
     :return: The matched NetBox site, or None if no match is found.
     """
-    normalized_name = normalize_site_name(ubiquity_desc)
-    logger.debug(f'Normalized Ubiquity description: "{ubiquity_desc}" -> "{normalized_name}"')
-
-    for netbox_normalized, netbox_site in normalized_netbox_sites.items():
-
-        # Check if the normalized Ubiquity name is a substring of the normalized NetBox site name
-        if normalized_name in netbox_normalized:
-            logger.debug(f'Matched Ubiquity site "{ubiquity_desc}" to NetBox site "{netbox_site.name}"')
-            return netbox_site
-
-    logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}"')
+    # Get the corresponding NetBox site name from the mapping
+    netbox_site_name = get_netbox_site_name(ubiquity_desc, config)
+    logger.debug(f'Mapping Ubiquity site: "{ubiquity_desc}" -> "{netbox_site_name}"')
+    
+    # Look for exact match in NetBox sites
+    if netbox_site_name in netbox_sites_dict:
+        netbox_site = netbox_sites_dict[netbox_site_name]
+        logger.debug(f'Matched Ubiquity site "{ubiquity_desc}" to NetBox site "{netbox_site.name}"')
+        return netbox_site
+    
+    # If site mapping is enabled but no match found, provide more helpful message
+    if config and 'UNIFI' in config and ('USE_SITE_MAPPING' in config['UNIFI'] and config['UNIFI']['USE_SITE_MAPPING'] or 
+                                        'SITE_MAPPINGS' in config['UNIFI'] and config['UNIFI']['SITE_MAPPINGS']):
+        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Add mapping in config.yaml or site_mapping.yaml.')
+    else:
+        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Enable site mapping in config.yaml if needed.')
     return None
 
 def setup_logging(min_log_level=logging.INFO):
@@ -315,6 +221,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
     """Process a device and add it to NetBox."""
     try:
         logger.info(f"Processing device {device['name']} at site {site}...")
+        logger.debug(f"Device details: Model={device.get('model')}, MAC={device.get('mac')}, IP={device.get('ip')}, Serial={device.get('serial')}")
 
         # Determine device role
         if str(device.get("is_access_point", "false")).lower() == "true":
@@ -329,6 +236,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
         # VRF creation
         vrf_name = f"vrf_{site}"
         vrf = None
+        logger.debug(f"Checking for existing VRF: {vrf_name}")
         try:
             vrf = nb.ipam.vrfs.get(name=vrf_name)
         except ValueError as e:
@@ -344,11 +252,13 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                 return
 
         if not vrf:
+            logger.debug(f"VRF {vrf_name} not found, creating new VRF")
             vrf = nb.ipam.vrfs.create({"name": vrf_name})
             if vrf:
                 logger.info(f"VRF {vrf_name} with ID {vrf.id} successfully added to NetBox.")
 
         # Device Type creation
+        logger.debug(f"Checking for existing device type: {device['model']} (manufacturer ID: {nb_ubiquity.id})")
         nb_device_type = nb.dcim.device_types.get(model=device["model"], manufacturer_id=nb_ubiquity.id)
         if not nb_device_type:
             try:
@@ -375,19 +285,39 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                             logger.exception(f"Failed to create interface template for {device['name']} at site {site}: {e}")
 
         # Check for existing device
+        logger.debug(f"Checking if device already exists: {device['name']} (serial: {device['serial']})")
         if nb.dcim.devices.get(site_id=site.id, serial=device["serial"]):
             logger.info(f"Device {device['name']} with serial {device['serial']} already exists. Skipping...")
             return
 
         # Create NetBox Device
         try:
-            nb_device = nb.dcim.devices.create({
-                "name": device["name"],
-                "device_type": nb_device_type.id,
-                "role": nb_device_role.id,
-                "site": site.id,
-                "serial": device["serial"],
-            })
+            device_data = {
+                    'name': device["name"],
+                    'device_type': nb_device_type.id,
+                    'tenant': tenant.id,
+                    'site': site.id,
+                    'serial': device["serial"]
+                }
+
+            logger.debug(f"Getting postable fields for NetBox API")
+            available_fields = get_postable_fields(netbox_url, netbox_token, 'dcim/devices')
+            logger.debug(f"Available NetBox API fields: {list(available_fields.keys())}")
+            if 'role' in available_fields:
+                logger.debug(f"Using 'role' field for device role (ID: {nb_device_role.id})")
+                device_data['role'] = nb_device_role.id
+            elif 'device_role' in available_fields:
+                logger.debug(f"Using 'device_role' field for device role (ID: {nb_device_role.id})")
+                device_data['device_role'] = nb_device_role.id
+            else:
+                logger.error(f'Could not determine the syntax for the role. Skipping device {device_name}, '
+                                f'{serial}.')
+                return None
+
+            # Add the device to Netbox
+            logger.debug(f"Creating device in NetBox with data: {device_data}")
+            nb_device = nb.dcim.devices.create(device_data)
+
             if nb_device:
                 logger.info(f"Device {device['name']} serial {device['serial']} with ID {nb_device.id} successfully added to NetBox.")
         except pynetbox.core.query.RequestError as e:
@@ -396,13 +326,11 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                 logger.warning(f"Device name {device['name']} already exists at site {site}. "
                                f"Trying with name {device['name']}_{device['serial']}.")
                 try:
-                    nb_device = nb.dcim.devices.create({
-                        "name": f"{device['name']}_{device['serial']}",
-                        "device_type": nb_device_type.id,
-                        "role": nb_device_role.id,
-                        "site": site.id,
-                        "serial": device["serial"],
-                    })
+                    # Just update the name in the existing device_data dictionary
+                    device_data['name'] = f"{device['name']}_{device['serial']}"
+                    
+                    # Add the device to Netbox with updated name
+                    nb_device = nb.dcim.devices.create(device_data)
                     if nb_device:
                         logger.info(f"Device {device['name']} with ID {nb_device.id} successfully added to NetBox.")
                 except pynetbox.core.query.RequestError as e2:
@@ -468,65 +396,73 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
     except Exception as e:
         logger.exception(f"Failed to process device {device['name']} at site {site}: {e}")
 
-def process_site(unifi, nb, site, nb_site, nb_ubiquity, tenant):
+def process_site(unifi, nb, site_name, nb_site, nb_ubiquity, tenant):
     """
     Process devices for a given site and add them to NetBox.
     """
-    path = f"/api/s/{site}/stat/device"
-    devices = unifi.make_request(path).get("data", [])
-    logger.debug(f"Processing {len(devices)} devices for site {site}...")
+    logger.debug(f"Processing site {site_name}...")
+    try:
+        logger.debug(f"Fetching site object for: {site_name}")
+        site = unifi.site(site_name)
+        if site:
+            logger.debug(f"Fetching devices for site: {site_name}")
+            devices = site.device.all()
+            logger.debug(f"Found {len(devices)} devices for site {site_name}")
 
-    with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
-        futures = []
-        for device in devices:
-            futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant))
+            with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
+                futures = []
+                for device in devices:
+                    futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant))
 
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error processing a device at site {site}: {e}")
-
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error processing a device at site {site_name}: {e}")
+        else:
+            logger.error(f"Site {site_name} not found")
+    except Exception as e:
+        logger.error(f"Failed to process site {site_name}: {e}")
 
 def process_controller(unifi_url, unifi_username, unifi_password, unifi_mfa_secret, nb, nb_ubiquity, tenant,
-                       normalized_netbox_sites):
+                       netbox_sites_dict, config=None):
     """
     Process all sites and devices for a specific UniFi controller.
     """
-    logger.info(f"Processing UniFi controller: {unifi_url}")
+    logger.info(f"Processing controller {unifi_url}...")
+    logger.debug(f"Initializing UniFi connection to: {unifi_url}")
 
     try:
         # Create a Unifi instance and authenticate
         unifi = Unifi(unifi_url, unifi_username, unifi_password, unifi_mfa_secret)
-        unifi.authenticate()
-
-        # Fetch sites
-        u_sites_response = unifi.make_request("/api/self/sites")
-        u_sites = u_sites_response.get("data", [])
-        logger.info(f"Found {len(u_sites)} sites for controller {unifi_url}")
+        logger.debug(f"UniFi connection established to: {unifi_url}")
+        
+        # Get all sites from the controller
+        logger.debug(f"Fetching sites from controller: {unifi_url}")
+        sites = unifi.sites
+        logger.debug(f"Found {len(sites)} sites on controller: {unifi_url}")
+        logger.info(f"Found {len(sites)} sites for controller {unifi_url}")
 
         with ThreadPoolExecutor(max_workers=MAX_SITE_THREADS) as executor:
             futures = []
-            for site in u_sites:
-                ubiquity_desc = site["desc"]
-                nb_site = match_sites_to_netbox(ubiquity_desc, normalized_netbox_sites)
+            for site_name, site_obj in sites.items():
+                logger.info(f"Processing site {site_name}...")
+                nb_site = match_sites_to_netbox(site_name, netbox_sites_dict, config)
 
                 if not nb_site:
-                    logger.warning(f"No match found for Ubiquity site: {ubiquity_desc}. Skipping...")
+                    logger.warning(f"No match found for Ubiquity site: {site_name}. Skipping...")
                     continue
 
-                futures.append(executor.submit(process_site, unifi, nb, site["name"], nb_site, nb_ubiquity, tenant))
+                futures.append(executor.submit(process_site, unifi, nb, site_obj.name, nb_site, nb_ubiquity, tenant))
 
             # Wait for all site-processing threads to complete
             for future in as_completed(futures):
                 future.result()
-
     except Exception as e:
         logger.error(f"Error processing controller {unifi_url}: {e}")
 
-
 def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret, nb, nb_ubiquity, tenant,
-                            normalized_netbox_sites):
+                            netbox_sites_dict, config=None):
     """
     Process all UniFi controllers in parallel.
     """
@@ -535,7 +471,7 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
         for url in unifi_url_list:
             futures.append(
                 executor.submit(process_controller, url, unifi_username, unifi_password, unifi_mfa_secret, nb,
-                                nb_ubiquity, tenant, normalized_netbox_sites))
+                                nb_ubiquity, tenant, netbox_sites_dict, config))
 
         # Wait for all controller-processing threads to complete
         for future in as_completed(futures):
@@ -548,50 +484,65 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
 def fetch_site_devices(unifi, site_name):
     """Fetch devices for a specific site."""
     logger.info(f"Fetching devices for site {site_name}...")
-    path = f"/api/s/{site_name}/stat/device"
-    devices = unifi.make_request(path).get("data", [])
-    return {site_name: devices}
+    try:
+        logger.debug(f"Getting site object for: {site_name}")
+        site = unifi.site(site_name)
+        if site:
+            logger.debug(f"Retrieving devices for site: {site_name}")
+            devices = site.device.all()
+            logger.debug(f"Retrieved {len(devices)} devices for site: {site_name}")
+            return devices
+        else:
+            logger.error(f"Site {site_name} not found")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to fetch devices for site {site_name}: {e}")
+        return None
 
-def process_all_sites(unifi, normalized_netbox_sites, nb, nb_ubiquity, tenant):
+def process_all_sites(unifi, netbox_sites_dict, nb, nb_ubiquity, tenant):
     """Process all sites and their devices concurrently."""
-    u_sites_response = unifi.make_request("/api/self/sites")
-    u_sites = u_sites_response.get("data", [])
+    # Get all sites from the unifi module
+    unifi_sites = unifi.sites
+    if not unifi_sites:
+        logger.error("Failed to fetch sites from UniFi controller.")
+        return
 
     sites = {}
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         # Fetch all devices per site concurrently
-        future_to_site = {executor.submit(fetch_site_devices, unifi, site["name"]): site for site in u_sites}
+        future_to_site = {executor.submit(fetch_site_devices, unifi, site_name): site_name for site_name in unifi_sites.keys()}
         for future in as_completed(future_to_site):
-            site = future_to_site[future]
+            site_name = future_to_site[future]
             try:
-                site_result = future.result()
-                site_name = list(site_result.keys())[0]
-                sites[site_name] = site_result[site_name]
-                logger.info(f"Successfully fetched devices for site {site_name}")
+                devices = future.result()
+                if devices:
+                    sites[site_name] = devices
+                    logger.info(f"Successfully fetched devices for site {site_name}")
             except Exception as e:
-                logger.error(f"Error fetching devices for site {site['name']}: {e}")
+                logger.error(f"Error fetching devices for site {site_name}: {e}")
 
     logger.info(f"Fetched {len(sites)} sites. Starting device processing...")
 
     # Process devices in parallel
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         future_to_device = {}
-        for site, devices in sites.items():
-            nb_site = normalized_netbox_sites.get(site)
+        for site_name, devices in sites.items():
+            # Use the site mapping to find the corresponding NetBox site
+            nb_site = match_sites_to_netbox(site_name, netbox_sites_dict)
             if not nb_site:
-                logger.warning(f"No matching NetBox site found for Ubiquity site {site}. Skipping...")
+                logger.warning(f"No matching NetBox site found for Ubiquity site {site_name}. Add mapping in site_mapping.yaml. Skipping...")
                 continue
             for device in devices:
                 future = executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant)
-                future_to_device[future] = (site, device)
+                future_to_device[future] = (site_name, device)
 
         for future in as_completed(future_to_device):
-            site, device = future_to_device[future]
+            site_name, device = future_to_device[future]
             try:
                 future.result()
-                logger.info(f"Successfully processed device {device['name']} at site {site}.")
+                logger.info(f"Successfully processed device {device['name']} at site {site_name}.")
             except Exception as e:
-                logger.error(f"Error processing device {device['name']} at site {site}: {e}")
+                logger.error(f"Error processing device {device['name']} at site {site_name}: {e}")
 
 def parse_successful_log_entries(log_file):
     """
@@ -627,9 +578,21 @@ def parse_successful_log_entries(log_file):
 
 
 if __name__ == "__main__":
-    # Configure logging
-    setup_logging(logging.INFO)
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Sync UniFi devices to NetBox')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose (debug) logging')
+    args = parser.parse_args()
+    
+    # Configure logging with appropriate level based on verbose flag
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    setup_logging(log_level)
+    
+    if args.verbose:
+        logger.debug("Verbose logging enabled")
+    logger.debug("Loading configuration")
     config = load_config()
+    logger.debug("Configuration loaded successfully")
     try:
         unifi_url_list = config['UNIFI']['URLS']
     except ValueError:
@@ -664,9 +627,11 @@ if __name__ == "__main__":
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
+    logger.debug(f"Initializing NetBox API connection to: {netbox_url}")
     nb = pynetbox.api(netbox_url, token=netbox_token, threading=True)
     nb.http_session.verify = False
     nb.http_session = session  # Attach the custom session
+    logger.debug("NetBox API connection established")
 
     nb_ubiquity = nb.dcim.manufacturers.get(slug='ubiquity')
     try:
@@ -699,10 +664,14 @@ if __name__ == "__main__":
         if lan_role:
             logger.info(f"LAN role {lan_role_name} with ID {lan_role.id} successfully added to Netbox.")
 
+    logger.debug("Fetching all NetBox sites")
     netbox_sites = nb.dcim.sites.all()
+    logger.debug(f"Found {len(netbox_sites)} sites in NetBox")
 
     # Preprocess NetBox sites
-    normalized_netbox_sites = prepare_netbox_sites(netbox_sites)
+    logger.debug("Preparing NetBox sites dictionary")
+    netbox_sites_dict = prepare_netbox_sites(netbox_sites)
+    logger.debug(f"Prepared {len(netbox_sites_dict)} NetBox sites for mapping")
 
     if not nb_ubiquity:
         nb_ubiquity = nb.dcim.manufacturers.create({'name': 'Ubiquity Networks', 'slug': 'ubiquity'})
@@ -711,5 +680,4 @@ if __name__ == "__main__":
 
     # Process all UniFi controllers in parallel
     process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret, nb, nb_ubiquity,
-                            tenant,
-                            normalized_netbox_sites)
+                            tenant, netbox_sites_dict, config)

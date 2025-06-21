@@ -5,9 +5,11 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
 ## Features
 
 - **Device Synchronization**: Automatically create or update devices from UniFi into NetBox.
+- **Site Mapping**: Customizable mapping between UniFi site names and NetBox site names via YAML configuration.
 - **Conflict Resolution**: Handle duplicate VRFs, IP addresses, and prefixes with advanced error handling and retry mechanisms.
 - **Custom Connection Management**: Optimize performance with configurable connection pooling for NetBox API communications.
-- **Error Logging**: Logs errors and warnings for easier debugging and monitoring.
+- **Detailed Logging**: Comprehensive logging with verbose mode for debugging and monitoring.
+- **Modular Design**: Improved code organization with a dedicated UniFi module for better maintainability.
 
 ## Requirements
 
@@ -59,6 +61,31 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
        LAN: Switch
      TENANT: Organization Name
    ```
+
+6. Configure site mapping (optional):
+   Site mapping is only needed if your UniFi site names differ from NetBox site names. You have two options for configuring site mappings:
+   
+   **Option 1: Configure in config.yaml (recommended)**
+   ```yaml
+   UNIFI:
+     # Other UNIFI settings...
+     # Set to true to use external site_mapping.yaml file
+     USE_SITE_MAPPING: false
+     # Define mappings directly in config.yaml
+     SITE_MAPPINGS:
+       "UniFi Site Name": "NetBox Site Name"
+       "Corporate Office": "HQ"
+   ```
+   
+   **Option 2: Use external mapping file**
+   Set `USE_SITE_MAPPING: true` in config.yaml, then edit `config/site_mapping.yaml`:
+   ```yaml
+   "UniFi Site Name": "NetBox Site Name"
+   "Corporate Office": "HQ"
+   "Remote Branch": "Branch-01"
+   ```
+   
+   If both options are configured, mappings in config.yaml take precedence.
 ## Obtaining the UniFi OTP Seed (MFA Secret)
 
 The OTP seed (also referred to as the MFA Secret) is required for Multi-Factor Authentication and must be added to the `.env` file. Follow these steps to obtain it:
@@ -97,13 +124,91 @@ Once the `.env` and `config/config.yaml` files are properly set up, you can run 
 python main.py
 ```
 
+For verbose logging with detailed debug information:
+
+```bash
+python main.py -v
+```
+
+### Site Mapping
+
+Site mapping is optional and only needed if your UniFi site names differ from NetBox site names. You have two ways to configure site mappings:
+
+#### Option 1: Configure in config.yaml (recommended)
+
+Define your mappings directly in the main configuration file:
+
+```yaml
+UNIFI:
+  # Other settings...
+  # Set to false to disable external mapping file
+  USE_SITE_MAPPING: false
+  # Define mappings directly here
+  SITE_MAPPINGS:
+    "UniFi Site Name": "NetBox Site Name"
+    "Corporate Office": "HQ"
+```
+
+#### Option 2: Use external mapping file
+
+Enable the external mapping file in config.yaml:
+
+```yaml
+UNIFI:
+  # Other settings...
+  USE_SITE_MAPPING: true
+```
+
+Then edit the `config/site_mapping.yaml` file:
+
+```yaml
+"UniFi Site Name": "NetBox Site Name"
+"Corporate Office": "HQ"
+"Remote Branch": "Branch-01"
+```
+
+**Note:** If both options are configured, mappings in config.yaml take precedence over those in the external file.
+
+If a UniFi site name is not found in any mapping, the script will use the UniFi site name directly when looking for a matching NetBox site.
+
 ### Logging
+
+The script logs information at different levels:
+
+- **INFO**: Standard operational information (default level)
+- **DEBUG**: Detailed debugging information (enabled with `-v` flag)
+- **WARNING**: Potential issues that don't prevent operation
+- **ERROR**: Problems that prevent specific operations
+- **CRITICAL**: Critical failures
 
 All logs are written to the `logs` directory. Logs are organized by severity (e.g., `info.log`, `error.log`) for easier debugging. Example of an error log:
 
 ```plaintext
 2025-01-22 14:24:54,390 - ERROR - Unable to delete VRF at site X: '409 Conflict'
 ```
+
+### Troubleshooting
+
+If you encounter issues with the integration:
+
+1. **Run with verbose logging**: Use the `-v` flag to enable detailed debug output
+   ```bash
+   python main.py -v
+   ```
+
+2. **Check log files**: Review the logs in the `logs` directory for specific errors
+
+3. **Verify site mapping**: Ensure your site mapping in `config/site_mapping.yaml` correctly maps UniFi sites to NetBox sites
+
+4. **Authentication issues**: 
+   - Verify your UniFi credentials and MFA secret in the `.env` file
+   - Check that your NetBox API token has appropriate permissions
+
+5. **API connectivity**: 
+   - Ensure the UniFi controller is accessible at the configured URL
+   - Verify the NetBox API is reachable and responding
+
+6. **Session issues**: If you encounter authentication problems, try deleting the session file and running again
 
 ### Handling Conflicts
 
